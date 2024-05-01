@@ -3,6 +3,8 @@
 Outillage et documentation pour la migration de VMware vSphere vers Openstack KVM.  
 Basés sur l'usage de l'outil virt-v2v.  
 
+**ATTENTION : Ce projet est archivé. Aucune maintenance ni support ne sera effectué par ses auteurs.**  
+
 Documentation fournie dans les sous-repertoires `documentation` et `virt-v2v_install`  
 Les éléments suivants sont disponibles:  
 
