@@ -32,7 +32,7 @@ A cet égard l'attention de l'utilisateur est attirée sur les risques associés
 
 Ce contrat est susceptible de s'appliquer à tout logiciel dont le titulaire des droits patrimoniaux décide de soumettre l'exploitation aux dispositions qu'il contient.
 
-Une liste de questions fréquemment posées se trouve sur le site web officiel de la famille des licences CeCILL ([http://www.cecill.info/index.fr.html](>http://www.cecill.info/index.fr.html)) pour toute clarification qui serait nécessaire.
+Une liste de questions fréquemment posées se trouve sur le site web officiel de la famille des licences CeCILL ([http://www.cecill.info/index.fr.html](http://www.cecill.info/index.fr.html)) pour toute clarification qui serait nécessaire.
 
 Article 1 \- DEFINITIONS
 ------------------------
