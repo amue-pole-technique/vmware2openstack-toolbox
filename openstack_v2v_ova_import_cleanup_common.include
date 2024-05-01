@@ -1,0 +1,132 @@
+#!/bin/bash
+
+# this script must be called with "source script.include" 
+# after the disks are imported in openstack, but before creating the VM
+#
+# It will attach and mount the sda system drive to the migration server, 
+# then try to mount the filesystem, allowing to alter the system configuration before starting the VM
+
+
+# the cleanup script to execute on the imported filesystem
+SCRIPT_CLEANUP_LINUX=$( dirname $0)/openstack_v2v_ova_import_cleanup_linux.sh
+
+
+
+if [[ "$VM_SYSTEM" == "linux" ]] && [[ -s "$SCRIPT_CLEANUP_LINUX" ]]; then
+	echo "Linux system detected ..."
+	# not really required, just to check for naming/case differences
+	VM_BOOT_VOL=$( openstack volume list --name ${VM_NAME}-sda --status available -f value )
+	if [ $? -ne 0 ] || [ -z "$VM_BOOT_VOL" ]; then echo "Error: could not found the volume ${VM_NAME}-sda"; exit 1; fi
+
+	# bad joke : the device setting can be ignored by the VM system, a /dev/sdc drive in openstack would appear as /dev/sdg in linux
+	# it is required to search for the partitions when the volume is attached
+	echo "Openstack: attaching volume ${VM_NAME}-sda to the server $THIS_VM_OPENSTACK_NAME ..."
+	VM_BOOT_VOL_ATTACH=$( openstack server add volume $THIS_VM_OPENSTACK_NAME ${VM_NAME}-sda )
+
+	# give some time to openstack and the system
+	sleep 10s
+
+	# strange bug with blkid sometimes listing uknown partitions => use lsblk instead
+	# retrieve the disk list, then exclude sda + any vfat partition then keep only unmounted disk
+	VM_PART_LIST=$( lsblk --noheadings --pair --path -o NAME,FSTYPE,UUID,MOUNTPOINT,STATE,SIZE |grep -i 'mountpoint=""' |grep -v -i 'state="running"' | grep -v 'FSTYPE="vfat"' |  egrep -v '/dev/(sda|loop)' )
+	if [ $? -ne 0 ] || [ -z "$VM_PART_LIST" ]; then 
+		echo "Warning: couldn't retrieve the partition list or empty"
+	else
+		LOOP_FOUND=0
+		LOOP_LVM_VG=""
+		LOOP_LVM_LV=""
+
+		# lsblk data: NAME="/dev/sde2" FSTYPE="LVM2_member" UUID="tAtHp5-oCcN-8Bdw-Z3fM-zbUf-txBr-kU3sq1" MOUNTPOINT="" STATE=""
+		while read -r LOOP_PARTINFO; do
+			# skip remaining partitions when done
+			if [ $LOOP_FOUND -eq 1 ]; then continue; fi
+
+			LOOP_PART=$( echo "${LOOP_PARTINFO}" | grep -Po '.*NAME="*\K.*?(?=")' )
+			LOOP_FS=$(   echo "${LOOP_PARTINFO}" | grep -Po '.*FSTYPE="*\K.*?(?=")' )
+			LOOP_SIZE=$( echo "${LOOP_PARTINFO}" | grep -Po '.*SIZE="*\K.*?(?=")' )
+			LOOP_MOUNTDIR=$WORKDIR/$( echo "$LOOP_PART" | rev | cut -d '/' -f1 | rev )
+			LOOP_LVM_VG_INFO=""
+			LOOP_LVM_VG=""
+			LOOP_LVM_LV=""
+
+			# skip small partitions for drive sector aligment
+			if echo "$LOOP_SIZE" |egrep -q -i '[^1-5]M'; then continue; fi
+
+			# TODO: use udisksctl from the udisks2 package which can autodetect a fs and mount it correctly
+
+			# lvm specific FS handling
+			if echo "$LOOP_FS" | grep -q -i LVM; then
+				echo "LVM detected on $LOOP_PART ..."
+
+				# refresh the vg and handle lvm not clearing removed drives
+				vgscan --mknodes
+				LOOP_LVM_VG_INFO=$( pvdisplay $LOOP_PART )
+				if [ $? -ne 0 ]; then echo "Warning: bad reply from pvdisplay - skipping "; echo "$LOOP_LVM_VG_INFO"; continue; fi
+
+				# retrieve the vg name from the target partition
+				LOOP_LVM_VG=$( echo "$LOOP_LVM_VG_INFO" |grep -Po ".*VG Name *\K.*" | tr -d ' ' )
+				if [ $? -ne 0 ] || [ -z "$LOOP_LVM_VG" ]; then echo "Warning: no VG found - skipping"; continue; fi
+
+				# skip migration vg
+				if echo "$LOOP_LVM_VG" |grep -q -i "migration"; then echo "vg migration => skipping"; continue; fi
+
+				# activate the lvm vg
+				vgchange --ignorelockingfailure -a n $LOOP_LVM_VG
+				vgchange --ignorelockingfailure -a y $LOOP_LVM_VG
+
+				# required as the lvm lv might not be accessible by the system even if visible in lvm itself
+				sleep 5s
+				lvscan
+
+				# retrieve the lv name in the VG - looking for the one with the largest size
+				# the line format looks like  : "  y901_1 rootvg_1 -wi-------  <3,00g"
+				LOOP_LVM_LV=$( 	lvdisplay /dev/$LOOP_LVM_VG --column --sort lv_size |tail -1  |awk '{ print $1 }' )
+
+				LOOP_PART=/dev/$LOOP_LVM_VG/$LOOP_LVM_LV
+				echo "LVM volume found: $LOOP_PART"
+
+				# retrieve the fs type
+				LOOP_FS=$(lsblk --noheadings --pair --fs $LOOP_PART |grep -Po 'FSTYPE="\K.*?(?=")' )
+				if [ -z "$LOOP_FS" ]; then LOOP_FS=xfs; fi
+			fi
+
+			# TODO: use udisksctl from the udisks2 package which can autodetect a fs and mount correctly
+			echo "Mounting $LOOP_PART on $LOOP_MOUNTDIR ($LOOP_FS) ..."
+			mkdir -p $LOOP_MOUNTDIR
+			# sometimes mount has trouble with FS on a LVM partition
+			for i in {1..3}; do
+				sleep 3s
+				echo "try $i"
+				mount -t $LOOP_FS $LOOP_PART $LOOP_MOUNTDIR
+				if [ $? -eq 0 ]; then break; fi
+			done
+
+			sleep 5s
+			if [ -f "$LOOP_MOUNTDIR/etc/fstab" ]; then 
+				echo "Found the etc directory - starting the cleanup ..."
+
+				bash $SCRIPT_CLEANUP_LINUX "$LOOP_MOUNTDIR" 
+				# no error checking on purpose
+
+				# No need to check on other partitions
+				LOOP_FOUND=1
+			fi
+
+			# remove the mounted partition
+			# ignore errors here, openstack umount will do the cleanup
+			umount $LOOP_MOUNTDIR
+
+			# deactivate the lvm vg
+			if [ ! -z "$LOOP_LVM_VG" ]; then vgchange -a n /dev/$LOOP_LVM_VG; fi
+
+		done  <<< "${VM_PART_LIST}"
+	fi
+
+	# all done, remove the volume
+	openstack server remove volume $THIS_VM_OPENSTACK_NAME ${VM_NAME}-sda
+	if [ $? -ne 0 ]; then echo "Error: couldn't remove properly the volume ${VM_NAME}-sda from this VM $THIS_VM_OPENSTACK_NAME"; exit 1; fi
+
+	# remove the lvm /dev nodes after the physical drive removal
+	if [ ! -z "$LOOP_LVM_VG" ]; then vgscan --mknodes; fi
+fi
+
